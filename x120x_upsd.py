@@ -499,7 +499,7 @@ class Publisher:
 
     def publish_json_file(self):
         report = self.get_report()
-        if self._json_report_file != '':
+        if self._json_report_file != '' and self._json_report_period > 0:
             try:
                 with open(self._json_report_file, 'w') as json_file:
                     json.dump(report, json_file)
@@ -567,7 +567,7 @@ class Publisher:
 
     def start_api_server(self):
         handler = partial(_ApiHandler, self.get_report)
-        self._http_server = HTTPServer(('', self._api_port), handler)
+        self._http_server = HTTPServer(('127.0.0.1', self._api_port), handler)
         self._http_thread = Thread(target=self._http_server.serve_forever, daemon=True)
         self._http_thread.start()
         print(f'HTTP REST API started on port {self._api_port}.', flush=True)
@@ -594,11 +594,14 @@ class Publisher:
         print(f'WebSocket server started on port {self._websocket_port}.', flush=True)
 
     def stop_websocket_server(self):
-        if self._websocket_loop and not self._websocket_loop.is_closed():
+        loop = self._websocket_loop
+        if loop and not loop.is_closed():
             if self._websocket_serve_task:
-                self._websocket_loop.call_soon_threadsafe(self._websocket_serve_task.cancel)
+                loop.call_soon_threadsafe(self._websocket_serve_task.cancel)
+            loop.call_soon_threadsafe(loop.stop)
         if self._websocket_thread:
             self._websocket_thread.join(timeout=_WEBSOCKET_SHUTDOWN_TIMEOUT)
+            self._websocket_thread = None
 
     def _run_websocket(self):
         loop = asyncio.new_event_loop()
@@ -606,7 +609,7 @@ class Publisher:
         self._websocket_loop = loop
 
         async def _serve():
-            async with websockets.serve(self._websocket_handler, '', self._websocket_port):
+            async with websockets.serve(self._websocket_handler, '127.0.0.1', self._websocket_port):
                 self._websocket_serve_task = asyncio.current_task()
                 await asyncio.Future()  # run until cancelled
 
