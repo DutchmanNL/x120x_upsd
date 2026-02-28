@@ -9,6 +9,7 @@ It manages charging of the lithium cells.
 It shuts down the pi when condfigured parameters are reached.
 """
 
+import asyncio
 import configparser
 import os
 import signal
@@ -23,9 +24,17 @@ import json
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from functools import partial
 from gpiozero import InputDevice, Button
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from subprocess import run
 from threading import Thread, Event, Timer
+
+try:
+    import websockets
+    _WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    _WEBSOCKETS_AVAILABLE = False
 
 # Configuratiopn
 config = configparser.ConfigParser()
@@ -41,12 +50,16 @@ config['DEFAULT'] = {
     'json_report_period': '0',
     'disable_self_protect': 'Off',
     'no_power_at_start': 'default',
-    'temperature_sensor_type': ''
+    'temperature_sensor_type': '',
+    'api_port': '0',
+    'websocket_port': '0',
 }
 
 CONFIG_FILE = '/usr/local/etc/x120x_upsd.ini'
 
 # Constants
+_DEFAULT_WEBSOCKET_PERIOD = 30   # seconds between WebSocket broadcasts when json_report_period is 0
+_WEBSOCKET_SHUTDOWN_TIMEOUT = 5  # seconds to wait for WebSocket thread to stop
 CHG_ONOFF_PIN = 16
 CHG_PRESENT_PIN = 6
 BUS_ADDRESS = 1
@@ -429,9 +442,32 @@ class UPS_monitor:
             time.sleep(30)
 
 
+class _ApiHandler(BaseHTTPRequestHandler):
+    """Simple HTTP request handler that serves the UPS status as JSON."""
+
+    def __init__(self, get_data_func, *args, **kwargs):
+        self._get_data = get_data_func
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        if self.path == '/':
+            response = json.dumps(self._get_data()).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(response))
+            self.end_headers()
+            self.wfile.write(response)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress HTTP access log messages
+
+
 class Publisher:
     '''This class will handle various external communication whith the UPS daemon'''
-    def __init__(self, battery=None, charger=None, ups=None, stop_signal = None, battery_report_schedule='', json_report_file='', json_report_period=0):
+    def __init__(self, battery=None, charger=None, ups=None, stop_signal = None, battery_report_schedule='', json_report_file='', json_report_period=0, api_port=0, websocket_port=0):
         self._battery = battery
         self._charger = charger
         self._stop_signal = stop_signal
@@ -440,9 +476,18 @@ class Publisher:
         self._json_report_period = json_report_period
         self._publish_json_file_thread = None
         self._ups = ups
+        self._api_port = api_port
+        self._websocket_port = websocket_port
+        self._http_server = None
+        self._http_thread = None
+        self._websocket_thread = None
+        self._websocket_loop = None
+        self._websocket_clients = set()
+        self._websocket_serve_task = None
 
 
-    def publish_json_file(self):
+    def get_report(self):
+        """Build and return the current UPS status as a dict."""
         report = {}
         if self._battery:
             report.update(self._battery.json_report())
@@ -450,17 +495,25 @@ class Publisher:
             report.update(self._charger.json_report())
         if self._ups:
             report.update(self._ups.json_report())
+        return report
+
+    def publish_json_file(self):
+        report = self.get_report()
         if self._json_report_file != '':
             try:
                 with open(self._json_report_file, 'w') as json_file:
                     json.dump(report, json_file)
             except IOError as e:
                 print(f"Error writing battery report to JSON file ({self._json_report_file}): {e}", flush=True)
+        if self._websocket_loop and not self._websocket_loop.is_closed() and self._websocket_clients:
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast(json.dumps(report)), self._websocket_loop)
 
     def _publish_json_file_process(self):
+        period = self._json_report_period if self._json_report_period > 0 else _DEFAULT_WEBSOCKET_PERIOD
         while not self._stop_publish_json_file_thread.is_set():
             self.publish_json_file()
-            time.sleep(self._json_report_period)
+            time.sleep(period)
 
     def start_publish_json_file_process(self):
         if not(self._publish_json_file_thread and self._publish_json_file_thread.is_alive()):
@@ -487,15 +540,96 @@ class Publisher:
             self._regular_report = None
 
     def start_publishers(self):
-        if self._json_report_file != '' and self._json_report_period > 0:
+        needs_periodic = (self._json_report_file != '' and self._json_report_period > 0) \
+                         or self._websocket_port > 0
+        if needs_periodic:
             self.start_publish_json_file_process()
         if self._battery_report_schedule != '':
             self.start_regular_battery_report(self._battery_report_schedule)
+        if self._api_port > 0:
+            self.start_api_server()
+        if self._websocket_port > 0:
+            self.start_websocket_server()
+
     def stop_publishers(self):
-        if self._json_report_file != '':
+        needs_periodic = (self._json_report_file != '' and self._json_report_period > 0) \
+                         or self._websocket_port > 0
+        if needs_periodic:
             self.stop_publish_json_file_process()
         if self._battery_report_schedule != '':
             self.stop_regular_battery_report()
+        if self._api_port > 0:
+            self.stop_api_server()
+        if self._websocket_port > 0:
+            self.stop_websocket_server()
+
+    # HTTP REST API
+
+    def start_api_server(self):
+        handler = partial(_ApiHandler, self.get_report)
+        self._http_server = HTTPServer(('', self._api_port), handler)
+        self._http_thread = Thread(target=self._http_server.serve_forever, daemon=True)
+        self._http_thread.start()
+        print(f'HTTP REST API started on port {self._api_port}.', flush=True)
+
+    def stop_api_server(self):
+        if self._http_server:
+            self._http_server.shutdown()
+            self._http_server = None
+
+    # WebSocket server
+
+    def start_websocket_server(self):
+        if not _WEBSOCKETS_AVAILABLE:
+            print('websockets package not available, WebSocket server not started.', flush=True)
+            return
+        self._websocket_thread = Thread(target=self._run_websocket, daemon=True)
+        self._websocket_thread.start()
+        print(f'WebSocket server started on port {self._websocket_port}.', flush=True)
+
+    def stop_websocket_server(self):
+        if self._websocket_loop and not self._websocket_loop.is_closed():
+            if self._websocket_serve_task:
+                self._websocket_loop.call_soon_threadsafe(self._websocket_serve_task.cancel)
+        if self._websocket_thread:
+            self._websocket_thread.join(timeout=_WEBSOCKET_SHUTDOWN_TIMEOUT)
+
+    def _run_websocket(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._websocket_loop = loop
+
+        async def _serve():
+            async with websockets.serve(self._websocket_handler, '', self._websocket_port):
+                self._websocket_serve_task = asyncio.current_task()
+                await asyncio.Future()  # run until cancelled
+
+        try:
+            loop.run_until_complete(_serve())
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f'WebSocket server error: {e}', flush=True)
+        finally:
+            self._websocket_loop = None
+            loop.close()
+
+    async def _websocket_handler(self, websocket, *args):
+        self._websocket_clients.add(websocket)
+        try:
+            await websocket.send(json.dumps(self.get_report()))
+            async for _ in websocket:
+                pass  # discard incoming messages, keep connection alive
+        except Exception:
+            pass
+        finally:
+            self._websocket_clients.discard(websocket)
+
+    async def _broadcast(self, message):
+        if self._websocket_clients:
+            await asyncio.gather(
+                *[ws.send(message) for ws in self._websocket_clients.copy()],
+                return_exceptions=True)
 
 class GracefullKiller:
     kill_now = False
@@ -591,6 +725,8 @@ if __name__ == '__main__':
     JSON_REPORT_FILE        = config['general'].get('json_report_file').strip().strip('"')
     JSON_REPORT_PERIOD      = config['general'].getint('json_report_period')
     TEMPERATURE_SENSOR_TYPE = config['general'].get('temperature_sensor_type')
+    API_PORT                = config['general'].getint('api_port')
+    WEBSOCKET_PORT          = config['general'].getint('websocket_port')
     # Ensure only one instance of the script is running
     if PIDFILE != '':
         pid = str(os.getpid())
@@ -625,7 +761,8 @@ if __name__ == '__main__':
             battery.start_charge_control() # Do not warmup, handle charging if power returns
             # We are not starting ups for this session.
         publisher = Publisher(stop_signal=stopsignal, battery=battery, charger=charger, ups=ups, battery_report_schedule=BATTERY_REPORT_SCHEDULE,
-                              json_report_file=JSON_REPORT_FILE, json_report_period=JSON_REPORT_PERIOD)
+                              json_report_file=JSON_REPORT_FILE, json_report_period=JSON_REPORT_PERIOD,
+                              api_port=API_PORT, websocket_port=WEBSOCKET_PORT)
         publisher.print_battery_report()
         publisher.start_publishers()
         systemd.daemon.notify('READY=1')

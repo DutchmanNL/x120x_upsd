@@ -1,6 +1,6 @@
 #!/bin/sh
 apt install -y python3-apscheduler python3-decorator python3-gpiozero \
-    python3-smbus2 python3-systemd
+    python3-smbus2 python3-systemd python3-websockets
 
 cp x120x_upsd.py /usr/local/bin
 cp -n x120x_upsd.ini /usr/local/etc || true
