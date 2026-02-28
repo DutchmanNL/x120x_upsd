@@ -505,7 +505,7 @@ class Publisher:
                     json.dump(report, json_file)
             except IOError as e:
                 print(f"Error writing battery report to JSON file ({self._json_report_file}): {e}", flush=True)
-        if self._websocket_loop and not self._websocket_loop.is_closed() and self._websocket_clients:
+        if self._websocket_loop and not self._websocket_loop.is_closed():
             asyncio.run_coroutine_threadsafe(
                 self._broadcast(json.dumps(report)), self._websocket_loop)
 
