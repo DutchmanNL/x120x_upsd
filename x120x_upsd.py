@@ -574,7 +574,13 @@ class Publisher:
 
     def stop_api_server(self):
         if self._http_server:
+            # Request the HTTP server to stop serving, then close the listening socket
             self._http_server.shutdown()
+            self._http_server.server_close()
+            # Wait for the HTTP server thread to finish, but don't block indefinitely
+            if self._http_thread:
+                self._http_thread.join(timeout=5.0)
+                self._http_thread = None
             self._http_server = None
 
     # WebSocket server
