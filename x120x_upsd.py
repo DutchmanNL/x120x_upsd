@@ -56,7 +56,7 @@ config['DEFAULT'] = {
     'no_power_at_start': 'default',
     'temperature_sensor_type': '',
     'api_port': '6969',
-    'api_bind_address': '127.0.0.1',
+    'api_bind_address': '',
 }
 
 CONFIG_FILE = '/usr/local/etc/x120x_upsd.ini'
