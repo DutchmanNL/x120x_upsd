@@ -554,7 +554,6 @@ class Publisher:
         if loop and not loop.is_closed():
             if self._server_serve_task:
                 loop.call_soon_threadsafe(self._server_serve_task.cancel)
-            loop.call_soon_threadsafe(loop.stop)
         if self._server_thread:
             self._server_thread.join(timeout=_SERVER_SHUTDOWN_TIMEOUT)
             self._server_thread = None
