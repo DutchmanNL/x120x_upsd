@@ -53,6 +53,8 @@ config['DEFAULT'] = {
     'temperature_sensor_type': '',
     'api_port': '0',
     'websocket_port': '0',
+    'api_bind_address': '',
+    'websocket_bind_address': '',
 }
 
 CONFIG_FILE = '/usr/local/etc/x120x_upsd.ini'
@@ -467,7 +469,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
 
 class Publisher:
     '''This class will handle various external communication whith the UPS daemon'''
-    def __init__(self, battery=None, charger=None, ups=None, stop_signal = None, battery_report_schedule='', json_report_file='', json_report_period=0, api_port=0, websocket_port=0):
+    def __init__(self, battery=None, charger=None, ups=None, stop_signal = None, battery_report_schedule='', json_report_file='', json_report_period=0, api_port=0, websocket_port=0, api_bind_address='', websocket_bind_address=''):
         self._battery = battery
         self._charger = charger
         self._stop_signal = stop_signal
@@ -478,6 +480,8 @@ class Publisher:
         self._ups = ups
         self._api_port = api_port
         self._websocket_port = websocket_port
+        self._api_bind_address = api_bind_address
+        self._websocket_bind_address = websocket_bind_address
         self._http_server = None
         self._http_thread = None
         self._websocket_thread = None
@@ -567,10 +571,11 @@ class Publisher:
 
     def start_api_server(self):
         handler = partial(_ApiHandler, self.get_report)
-        self._http_server = HTTPServer(('127.0.0.1', self._api_port), handler)
+        self._http_server = HTTPServer((self._api_bind_address, self._api_port), handler)
         self._http_thread = Thread(target=self._http_server.serve_forever, daemon=True)
         self._http_thread.start()
-        print(f'HTTP REST API started on port {self._api_port}.', flush=True)
+        bind_display = self._api_bind_address if self._api_bind_address else '0.0.0.0'
+        print(f'HTTP REST API started on {bind_display}:{self._api_port}.', flush=True)
 
     def stop_api_server(self):
         if self._http_server:
@@ -591,7 +596,8 @@ class Publisher:
             return
         self._websocket_thread = Thread(target=self._run_websocket, daemon=True)
         self._websocket_thread.start()
-        print(f'WebSocket server started on port {self._websocket_port}.', flush=True)
+        bind_display = self._websocket_bind_address if self._websocket_bind_address else '0.0.0.0'
+        print(f'WebSocket server started on {bind_display}:{self._websocket_port}.', flush=True)
 
     def stop_websocket_server(self):
         loop = self._websocket_loop
@@ -609,7 +615,7 @@ class Publisher:
         self._websocket_loop = loop
 
         async def _serve():
-            async with websockets.serve(self._websocket_handler, '127.0.0.1', self._websocket_port):
+            async with websockets.serve(self._websocket_handler, self._websocket_bind_address, self._websocket_port):
                 self._websocket_serve_task = asyncio.current_task()
                 await asyncio.Future()  # run until cancelled
 
@@ -736,6 +742,8 @@ if __name__ == '__main__':
     TEMPERATURE_SENSOR_TYPE = config['general'].get('temperature_sensor_type')
     API_PORT                = config['general'].getint('api_port')
     WEBSOCKET_PORT          = config['general'].getint('websocket_port')
+    API_BIND_ADDRESS        = config['general'].get('api_bind_address').strip()
+    WEBSOCKET_BIND_ADDRESS  = config['general'].get('websocket_bind_address').strip()
     # Ensure only one instance of the script is running
     if PIDFILE != '':
         pid = str(os.getpid())
@@ -771,7 +779,8 @@ if __name__ == '__main__':
             # We are not starting ups for this session.
         publisher = Publisher(stop_signal=stopsignal, battery=battery, charger=charger, ups=ups, battery_report_schedule=BATTERY_REPORT_SCHEDULE,
                               json_report_file=JSON_REPORT_FILE, json_report_period=JSON_REPORT_PERIOD,
-                              api_port=API_PORT, websocket_port=WEBSOCKET_PORT)
+                              api_port=API_PORT, websocket_port=WEBSOCKET_PORT,
+                              api_bind_address=API_BIND_ADDRESS, websocket_bind_address=WEBSOCKET_BIND_ADDRESS)
         publisher.print_battery_report()
         publisher.start_publishers()
         systemd.daemon.notify('READY=1')
