@@ -11,6 +11,7 @@ It shuts down the pi when condfigured parameters are reached.
 
 import asyncio
 import configparser
+import http
 import os
 import signal
 import smbus2
@@ -24,17 +25,20 @@ import json
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from functools import partial
 from gpiozero import InputDevice, Button
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from subprocess import run
 from threading import Thread, Event, Timer
 
 try:
     import websockets
     _WEBSOCKETS_AVAILABLE = True
+    _WS_NEW_API = int(websockets.__version__.split('.')[0]) >= 14
+    if _WS_NEW_API:
+        from websockets.http11 import Response as _WsResponse
+        from websockets.datastructures import Headers as _WsHeaders
 except ImportError:
     _WEBSOCKETS_AVAILABLE = False
+    _WS_NEW_API = False
 
 # Configuratiopn
 config = configparser.ConfigParser()
@@ -51,17 +55,15 @@ config['DEFAULT'] = {
     'disable_self_protect': 'Off',
     'no_power_at_start': 'default',
     'temperature_sensor_type': '',
-    'api_port': '0',
-    'websocket_port': '0',
-    'api_bind_address': '',
-    'websocket_bind_address': '',
+    'combined_port': '6969',
+    'combined_bind_address': '',
 }
 
 CONFIG_FILE = '/usr/local/etc/x120x_upsd.ini'
 
 # Constants
-_DEFAULT_WEBSOCKET_PERIOD = 30   # seconds between WebSocket broadcasts when json_report_period is 0
-_WEBSOCKET_SHUTDOWN_TIMEOUT = 5  # seconds to wait for WebSocket thread to stop
+_DEFAULT_BROADCAST_PERIOD = 30   # seconds between WebSocket broadcasts when json_report_period is 0
+_SERVER_SHUTDOWN_TIMEOUT = 5     # seconds to wait for server thread to stop
 CHG_ONOFF_PIN = 16
 CHG_PRESENT_PIN = 6
 BUS_ADDRESS = 1
@@ -444,32 +446,9 @@ class UPS_monitor:
             time.sleep(30)
 
 
-class _ApiHandler(BaseHTTPRequestHandler):
-    """Simple HTTP request handler that serves the UPS status as JSON."""
-
-    def __init__(self, get_data_func, *args, **kwargs):
-        self._get_data = get_data_func
-        super().__init__(*args, **kwargs)
-
-    def do_GET(self):
-        if self.path == '/':
-            response = json.dumps(self._get_data()).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', len(response))
-            self.end_headers()
-            self.wfile.write(response)
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        pass  # suppress HTTP access log messages
-
-
 class Publisher:
     '''This class will handle various external communication whith the UPS daemon'''
-    def __init__(self, battery=None, charger=None, ups=None, stop_signal = None, battery_report_schedule='', json_report_file='', json_report_period=0, api_port=0, websocket_port=0, api_bind_address='', websocket_bind_address=''):
+    def __init__(self, battery=None, charger=None, ups=None, stop_signal=None, battery_report_schedule='', json_report_file='', json_report_period=0, combined_port=6969, combined_bind_address=''):
         self._battery = battery
         self._charger = charger
         self._stop_signal = stop_signal
@@ -478,16 +457,12 @@ class Publisher:
         self._json_report_period = json_report_period
         self._publish_json_file_thread = None
         self._ups = ups
-        self._api_port = api_port
-        self._websocket_port = websocket_port
-        self._api_bind_address = api_bind_address
-        self._websocket_bind_address = websocket_bind_address
-        self._http_server = None
-        self._http_thread = None
-        self._websocket_thread = None
-        self._websocket_loop = None
+        self._combined_port = combined_port
+        self._combined_bind_address = combined_bind_address
+        self._server_thread = None
+        self._server_loop = None
         self._websocket_clients = set()
-        self._websocket_serve_task = None
+        self._server_serve_task = None
 
 
     def get_report(self):
@@ -509,12 +484,12 @@ class Publisher:
                     json.dump(report, json_file)
             except IOError as e:
                 print(f"Error writing battery report to JSON file ({self._json_report_file}): {e}", flush=True)
-        if self._websocket_loop and not self._websocket_loop.is_closed():
+        if self._server_loop and not self._server_loop.is_closed():
             asyncio.run_coroutine_threadsafe(
-                self._broadcast(json.dumps(report)), self._websocket_loop)
+                self._broadcast(json.dumps(report)), self._server_loop)
 
     def _publish_json_file_process(self):
-        period = self._json_report_period if self._json_report_period > 0 else _DEFAULT_WEBSOCKET_PERIOD
+        period = self._json_report_period if self._json_report_period > 0 else _DEFAULT_BROADCAST_PERIOD
         while not self._stop_publish_json_file_thread.is_set():
             self.publish_json_file()
             time.sleep(period)
@@ -545,78 +520,80 @@ class Publisher:
 
     def start_publishers(self):
         needs_periodic = (self._json_report_file != '' and self._json_report_period > 0) \
-                         or self._websocket_port > 0
+                         or self._combined_port > 0
         if needs_periodic:
             self.start_publish_json_file_process()
         if self._battery_report_schedule != '':
             self.start_regular_battery_report(self._battery_report_schedule)
-        if self._api_port > 0:
-            self.start_api_server()
-        if self._websocket_port > 0:
-            self.start_websocket_server()
+        if self._combined_port > 0:
+            self.start_combined_server()
 
     def stop_publishers(self):
         needs_periodic = (self._json_report_file != '' and self._json_report_period > 0) \
-                         or self._websocket_port > 0
+                         or self._combined_port > 0
         if needs_periodic:
             self.stop_publish_json_file_process()
         if self._battery_report_schedule != '':
             self.stop_regular_battery_report()
-        if self._api_port > 0:
-            self.stop_api_server()
-        if self._websocket_port > 0:
-            self.stop_websocket_server()
+        if self._combined_port > 0:
+            self.stop_combined_server()
 
-    # HTTP REST API
+    # Combined HTTP REST API + WebSocket server
 
-    def start_api_server(self):
-        handler = partial(_ApiHandler, self.get_report)
-        self._http_server = HTTPServer((self._api_bind_address, self._api_port), handler)
-        self._http_thread = Thread(target=self._http_server.serve_forever, daemon=True)
-        self._http_thread.start()
-        bind_display = self._api_bind_address if self._api_bind_address else '0.0.0.0'
-        print(f'HTTP REST API started on {bind_display}:{self._api_port}.', flush=True)
-
-    def stop_api_server(self):
-        if self._http_server:
-            # Request the HTTP server to stop serving, then close the listening socket
-            self._http_server.shutdown()
-            self._http_server.server_close()
-            # Wait for the HTTP server thread to finish, but don't block indefinitely
-            if self._http_thread:
-                self._http_thread.join(timeout=5.0)
-                self._http_thread = None
-            self._http_server = None
-
-    # WebSocket server
-
-    def start_websocket_server(self):
+    def start_combined_server(self):
         if not _WEBSOCKETS_AVAILABLE:
-            print('websockets package not available, WebSocket server not started.', flush=True)
+            print('websockets package not available, combined server not started.', flush=True)
             return
-        self._websocket_thread = Thread(target=self._run_websocket, daemon=True)
-        self._websocket_thread.start()
-        bind_display = self._websocket_bind_address if self._websocket_bind_address else '0.0.0.0'
-        print(f'WebSocket server started on {bind_display}:{self._websocket_port}.', flush=True)
+        self._server_thread = Thread(target=self._run_combined, daemon=True)
+        self._server_thread.start()
+        bind_display = self._combined_bind_address if self._combined_bind_address else '0.0.0.0'
+        print(f'Combined HTTP/WebSocket server started on {bind_display}:{self._combined_port}.', flush=True)
 
-    def stop_websocket_server(self):
-        loop = self._websocket_loop
+    def stop_combined_server(self):
+        loop = self._server_loop
         if loop and not loop.is_closed():
-            if self._websocket_serve_task:
-                loop.call_soon_threadsafe(self._websocket_serve_task.cancel)
+            if self._server_serve_task:
+                loop.call_soon_threadsafe(self._server_serve_task.cancel)
             loop.call_soon_threadsafe(loop.stop)
-        if self._websocket_thread:
-            self._websocket_thread.join(timeout=_WEBSOCKET_SHUTDOWN_TIMEOUT)
-            self._websocket_thread = None
+        if self._server_thread:
+            self._server_thread.join(timeout=_SERVER_SHUTDOWN_TIMEOUT)
+            self._server_thread = None
 
-    def _run_websocket(self):
+    def _run_combined(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        self._websocket_loop = loop
+        self._server_loop = loop
+
+        if _WS_NEW_API:
+            async def _process_request(connection, request):
+                if request.headers.get('Upgrade', '').lower() != 'websocket':
+                    if request.path == '/':
+                        body = json.dumps(self.get_report()).encode('utf-8')
+                        return _WsResponse(200, 'OK', _WsHeaders([
+                            ('Content-Type', 'application/json'),
+                            ('Content-Length', str(len(body))),
+                        ]), body)
+                    return _WsResponse(404, 'Not Found', _WsHeaders([]), b'')
+                return None
+        else:
+            async def _process_request(path, request_headers):
+                if request_headers.get('Upgrade', '').lower() != 'websocket':
+                    if path == '/':
+                        body = json.dumps(self.get_report()).encode('utf-8')
+                        return (http.HTTPStatus.OK, [
+                            ('Content-Type', 'application/json'),
+                            ('Content-Length', str(len(body))),
+                        ], body)
+                    return (http.HTTPStatus.NOT_FOUND, [], b'')
+                return None
 
         async def _serve():
-            async with websockets.serve(self._websocket_handler, self._websocket_bind_address, self._websocket_port):
-                self._websocket_serve_task = asyncio.current_task()
+            async with websockets.serve(
+                    self._websocket_handler,
+                    self._combined_bind_address,
+                    self._combined_port,
+                    process_request=_process_request):
+                self._server_serve_task = asyncio.current_task()
                 await asyncio.Future()  # run until cancelled
 
         try:
@@ -624,9 +601,9 @@ class Publisher:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f'WebSocket server error: {e}', flush=True)
+            print(f'Combined server error: {e}', flush=True)
         finally:
-            self._websocket_loop = None
+            self._server_loop = None
             loop.close()
 
     async def _websocket_handler(self, websocket, *args):
@@ -740,10 +717,8 @@ if __name__ == '__main__':
     JSON_REPORT_FILE        = config['general'].get('json_report_file').strip().strip('"')
     JSON_REPORT_PERIOD      = config['general'].getint('json_report_period')
     TEMPERATURE_SENSOR_TYPE = config['general'].get('temperature_sensor_type')
-    API_PORT                = config['general'].getint('api_port')
-    WEBSOCKET_PORT          = config['general'].getint('websocket_port')
-    API_BIND_ADDRESS        = config['general'].get('api_bind_address').strip()
-    WEBSOCKET_BIND_ADDRESS  = config['general'].get('websocket_bind_address').strip()
+    COMBINED_PORT           = config['general'].getint('combined_port')
+    COMBINED_BIND_ADDRESS   = config['general'].get('combined_bind_address').strip()
     # Ensure only one instance of the script is running
     if PIDFILE != '':
         pid = str(os.getpid())
@@ -779,8 +754,7 @@ if __name__ == '__main__':
             # We are not starting ups for this session.
         publisher = Publisher(stop_signal=stopsignal, battery=battery, charger=charger, ups=ups, battery_report_schedule=BATTERY_REPORT_SCHEDULE,
                               json_report_file=JSON_REPORT_FILE, json_report_period=JSON_REPORT_PERIOD,
-                              api_port=API_PORT, websocket_port=WEBSOCKET_PORT,
-                              api_bind_address=API_BIND_ADDRESS, websocket_bind_address=WEBSOCKET_BIND_ADDRESS)
+                              combined_port=COMBINED_PORT, combined_bind_address=COMBINED_BIND_ADDRESS)
         publisher.print_battery_report()
         publisher.start_publishers()
         systemd.daemon.notify('READY=1')
