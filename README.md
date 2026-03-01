@@ -31,6 +31,70 @@ sudo apt install python3-ftdi python3-sysv-ipc python3-usb python3-typing-extens
 sudo python -m pip install --break-system-packages adafruit-circuitpython-dht
 ```
 
+## JSON API
+
+The daemon can expose UPS status data via an HTTP REST API and/or a WebSocket server. Both interfaces serve the same JSON payload. Enable them in `x120x_upsd.ini` by setting `api_port` and/or `websocket_port` to a non-zero value.
+
+### HTTP REST API
+
+Send a `GET /` request to the configured port to retrieve the current status as JSON.
+
+```sh
+curl http://<host>:<api_port>/
+```
+
+### WebSocket API
+
+Connect to the WebSocket server on the configured port. The server sends the current status immediately upon connection and then broadcasts an updated payload every time the status is refreshed (interval controlled by `json_report_period`, default 30 s).
+
+```js
+const ws = new WebSocket("ws://<host>:<websocket_port>/");
+ws.onmessage = (event) => console.log(JSON.parse(event.data));
+```
+
+### JSON fields
+
+| Field | Type | Description |
+|---|---|---|
+| `current_capacity` | `float` | Current battery charge in percent (0–100). |
+| `current_voltage` | `float` | Current battery voltage in volts. |
+| `min_capacity` | `float` | Configured minimum charge percentage before shutdown. |
+| `min_voltage` | `float` | Configured minimum voltage before shutdown (0 = disabled). |
+| `max_capacity` | `float\|null` | Configured maximum charge percentage for charging control (`null` = not set). |
+| `max_voltage` | `float` | Configured maximum voltage for charging control (0 = disabled). |
+| `charger_present` | `bool` | Whether the AC power adapter / charger is detected. |
+| `charger_charging` | `bool` | Whether the battery is actively being charged. |
+| `shutdown_initiated` | `bool` | Whether a shutdown sequence has been triggered. |
+| `timer_no_power` | `float` | Seconds elapsed since AC power was lost (0 when power is present). |
+| `seconds_to_shutdown` | `float` | Seconds remaining before an automatic shutdown is triggered (only relevant when `ac_max_downtime` > 0). |
+| `battery_temperature` | `float` | *(optional)* Battery temperature in °C — only present when a temperature sensor is configured. |
+| `fan_state` | `string` | *(optional)* System fan state (`"on"` / `"auto"`) — only present when fan control is enabled. |
+
+### Example response
+
+<details>
+<summary>Click to expand example JSON</summary>
+
+```json
+{
+  "current_capacity": 78.5,
+  "current_voltage": 4.05,
+  "min_capacity": 20,
+  "min_voltage": 3.5,
+  "max_capacity": 80,
+  "max_voltage": 0,
+  "charger_present": true,
+  "charger_charging": false,
+  "shutdown_initiated": false,
+  "timer_no_power": 0,
+  "seconds_to_shutdown": 300,
+  "battery_temperature": 28.4,
+  "fan_state": "auto"
+}
+```
+
+</details>
+
 ## Todo
 - ~~Add monitoring for a temperature sensor to measure battery temperature. Need to decide which sensor 1st.~~
 - ~~An api for an applet of some sorts? HTTP REST API and WebSocket added.~~
