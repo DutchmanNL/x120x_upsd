@@ -55,8 +55,8 @@ config['DEFAULT'] = {
     'disable_self_protect': 'Off',
     'no_power_at_start': 'default',
     'temperature_sensor_type': '',
-    'combined_port': '6969',
-    'combined_bind_address': '127.0.0.1',
+    'api_port': '6969',
+    'api_bind_address': '127.0.0.1',
 }
 
 CONFIG_FILE = '/usr/local/etc/x120x_upsd.ini'
@@ -447,8 +447,8 @@ class UPS_monitor:
 
 
 class Publisher:
-    '''This class will handle various external communication whith the UPS daemon'''
-    def __init__(self, battery=None, charger=None, ups=None, stop_signal=None, battery_report_schedule='', json_report_file='', json_report_period=0, combined_port=6969, combined_bind_address=''):
+    '''This class will handle various external communication with the UPS daemon'''
+    def __init__(self, battery=None, charger=None, ups=None, stop_signal=None, battery_report_schedule='', json_report_file='', json_report_period=0, api_port=6969, api_bind_address=''):
         self._battery = battery
         self._charger = charger
         self._stop_signal = stop_signal
@@ -457,8 +457,8 @@ class Publisher:
         self._json_report_period = json_report_period
         self._publish_json_file_thread = None
         self._ups = ups
-        self._combined_port = combined_port
-        self._combined_bind_address = combined_bind_address
+        self._api_port = api_port
+        self._api_bind_address = api_bind_address
         self._server_thread = None
         self._server_loop = None
         self._websocket_clients = set()
@@ -520,22 +520,22 @@ class Publisher:
 
     def start_publishers(self):
         needs_periodic = (self._json_report_file != '' and self._json_report_period > 0) \
-                         or self._combined_port > 0
+                         or self._api_port > 0
         if needs_periodic:
             self.start_publish_json_file_process()
         if self._battery_report_schedule != '':
             self.start_regular_battery_report(self._battery_report_schedule)
-        if self._combined_port > 0:
+        if self._api_port > 0:
             self.start_combined_server()
 
     def stop_publishers(self):
         needs_periodic = (self._json_report_file != '' and self._json_report_period > 0) \
-                         or self._combined_port > 0
+                         or self._api_port > 0
         if needs_periodic:
             self.stop_publish_json_file_process()
         if self._battery_report_schedule != '':
             self.stop_regular_battery_report()
-        if self._combined_port > 0:
+        if self._api_port > 0:
             self.stop_combined_server()
 
     # Combined HTTP REST API + WebSocket server
@@ -546,8 +546,8 @@ class Publisher:
             return
         self._server_thread = Thread(target=self._run_combined, daemon=True)
         self._server_thread.start()
-        bind_display = self._combined_bind_address if self._combined_bind_address else '0.0.0.0'
-        print(f'Combined HTTP/WebSocket server started on {bind_display}:{self._combined_port}.', flush=True)
+        bind_display = self._api_bind_address if self._api_bind_address else '0.0.0.0'
+        print(f'Combined HTTP/WebSocket server started on {bind_display}:{self._api_port}.', flush=True)
 
     def stop_combined_server(self):
         loop = self._server_loop
@@ -589,8 +589,8 @@ class Publisher:
         async def _serve():
             async with websockets.serve(
                     self._websocket_handler,
-                    self._combined_bind_address,
-                    self._combined_port,
+                    self._api_bind_address,
+                    self._api_port,
                     process_request=_process_request):
                 self._server_serve_task = asyncio.current_task()
                 await asyncio.Future()  # run until cancelled
@@ -716,8 +716,8 @@ if __name__ == '__main__':
     JSON_REPORT_FILE        = config['general'].get('json_report_file').strip().strip('"')
     JSON_REPORT_PERIOD      = config['general'].getint('json_report_period')
     TEMPERATURE_SENSOR_TYPE = config['general'].get('temperature_sensor_type')
-    COMBINED_PORT           = config['general'].getint('combined_port')
-    COMBINED_BIND_ADDRESS   = config['general'].get('combined_bind_address').strip()
+    API_PORT                = config['general'].getint('api_port')
+    API_BIND_ADDRESS        = config['general'].get('api_bind_address').strip()
     # Ensure only one instance of the script is running
     if PIDFILE != '':
         pid = str(os.getpid())
@@ -753,7 +753,7 @@ if __name__ == '__main__':
             # We are not starting ups for this session.
         publisher = Publisher(stop_signal=stopsignal, battery=battery, charger=charger, ups=ups, battery_report_schedule=BATTERY_REPORT_SCHEDULE,
                               json_report_file=JSON_REPORT_FILE, json_report_period=JSON_REPORT_PERIOD,
-                              combined_port=COMBINED_PORT, combined_bind_address=COMBINED_BIND_ADDRESS)
+                              api_port=API_PORT, api_bind_address=API_BIND_ADDRESS)
         publisher.print_battery_report()
         publisher.start_publishers()
         systemd.daemon.notify('READY=1')
