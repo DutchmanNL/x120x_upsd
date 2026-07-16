@@ -17,12 +17,51 @@ I wrote this because I needed something a bit more robust and flexible than what
 - It is meant to run as a systemd service, but can be run directly.
 - A temperature sensor attached to the lithium-cells can be used to monitor the cells to be in the correct temperature range for charging or dis-charging. Currently the Adafruit DHT22 and DHT11 are implemented. Pull requests for other types are welcome.
 - Cool down the case by spinning the system fan when the batteries reach 50C.
+- Guarantees the Pi comes back on its own after a power failure — including the corner case where power returns during the shutdown itself (see below).
+
+## Automatic restart after a power failure
+
+The X120x auto-power-on only triggers on an **AC power-restore edge**: the
+board re-enables its output when adapter power (re)appears while the output is
+off. Two things must be true for unattended recovery, and this repo handles
+both:
+
+1. **The Pi must really power off** so the UPS stops detecting it and cuts its
+   own output (preserving the battery and arming auto-power-on). That requires
+   the `POWER_OFF_ON_HALT=1` EEPROM setting — `install.sh` checks and stages it
+   (together with `PSU_MAX_CURRENT=5000`) automatically.
+2. **The Pi must never power off while AC is present.** If power returns
+   during the shutdown grace period and the cancellation loses the race, the
+   system completes its poweroff with AC already present — no restore edge
+   will ever come, and the Pi waits for a button press forever. The
+   `ups-poweroff-guard.service` installed by this repo runs at the very end of
+   every poweroff and converts it into a reboot when AC (GPIO6, the X120x
+   power-loss-detection pin) is present.
+
+To intentionally shut down and stay off while AC is present:
+```
+sudo touch /run/ups-poweroff-guard.skip && sudo poweroff
+```
+
+Also note: on a power failure the daemon now always starts the
+`ac_max_downtime` timer. Previously the timer only started when the battery
+was below its charge target, so a power cut with a full battery would run the
+battery all the way down to the minimums regardless of `ac_max_downtime`.
+
+### Testing the full cycle
+
+1. Pull the AC adapter.
+2. Wait for the configured shutdown (with `ac_max_downtime: 0` the default
+   config shuts down at 25% capacity; for a quick test set `ac_max_downtime: 1`
+   → poweroff after ~2 minutes). The UPS LEDs go dark a few seconds after the
+   Pi powers off.
+3. Reconnect the adapter: the Pi boots by itself. No button press needed.
 
 ## Install
 1. Clone or download this repository.
 2. Review the `x12x_ups.ini` and set according to your needs. [^1]
 3. Review and understand the provided `install.sh` script as it is a good practice. 
-4. Run it with `sudo sh -x ./install.sh` to install files and dependencies and enable and start the service.
+4. Run it with `sudo ./install.sh` to install files and dependencies and enable and start the daemon and the poweroff guard. The script also stages the required EEPROM settings (`POWER_OFF_ON_HALT=1`, `PSU_MAX_CURRENT=5000`) — reboot once if it reports staged changes. Re-running the script is safe; an existing `/usr/local/etc/x120x_upsd.ini` is kept as-is.
 5. Optionally: To stop charging quickly after power on so that the deamon can manage it, add `gpio=16=pu` to `/boot/firware/config.txt` and reboot.
 6. Optionally: If using the DHT11 or DHT22 temperature sensor to monitor the lithium cell(s) add the adafruit dht package to your system and the system packages it depends on[^2]:
 ```
