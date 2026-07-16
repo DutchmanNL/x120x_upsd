@@ -1,6 +1,6 @@
 # Changelog
 
-## WIP
+## 1.1.0 (2026-07-16) - Poweroff guard + reliable outage shutdown
 Reliable unattended recovery after power failures: the Pi now always comes back on its own when AC power returns, and outage shutdown behavior matches the configuration.
 
 - Add `ups-poweroff-guard.service`: converts a poweroff into a reboot when AC power is still present, closing the race where power returns during the shutdown grace period and the Pi would stay off until a button press
