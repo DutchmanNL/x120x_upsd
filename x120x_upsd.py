@@ -368,7 +368,6 @@ class UPS_monitor:
         self._max_duration = max_duration * 60
         self._timer_no_power = Timer()
         self._shutdown_initiated = False
-        self._msg_no_power_no_charging_sent = False
         self._monitor_battery_thread = None
         self._monitor_charger_thread = None
         self._stopsignal = stopsignal
@@ -429,18 +428,13 @@ class UPS_monitor:
 
     def _monitor_charger(self):
         while not self._stop_monitor_charger.is_set() or not (self._stopsignal != None and self._stopsignal.kill_now):
-            if not self._msg_no_power_no_charging_sent and not self._charger.present \
-                    and self._timer_no_power.elapsed_time() == 0 and not self.battery.needs_charging():
-                print('Power failed, but the battery does not need charging', flush=True)
-                self._msg_no_power_no_charging_sent = True
-            elif not self._charger.present and self._timer_no_power.elapsed_time() == 0 and self.battery.needs_charging():
+            if not self._charger.present and self._timer_no_power.elapsed_time() == 0:
                 self._timer_no_power.start()
                 print('Power failed.', flush=True)
             elif self._charger.present and self._timer_no_power.elapsed_time() != 0:
                 if self._shutdown_initiated:
                     self.cancel_shutdown()
                 print(f'Power returned after {self._timer_no_power.stop():0.0f} seconds', flush=True)
-                self._msg_no_power_no_charging_sent = False
             elif not self._shutdown_initiated and self._max_duration and self._timer_no_power.elapsed_time() >= self._max_duration:
                 self.initiate_5_minute_shutdown(f'Power failed for {(self._timer_no_power.elapsed_time()/60):0.0f} minutes')
             time.sleep(30)

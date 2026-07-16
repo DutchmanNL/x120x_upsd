@@ -1,0 +1,12 @@
+[Unit]
+Description=Reboot instead of poweroff when UPS AC power is present
+DefaultDependencies=no
+After=final.target
+Before=systemd-poweroff.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ups-poweroff-guard.sh
+
+[Install]
+WantedBy=poweroff.target
